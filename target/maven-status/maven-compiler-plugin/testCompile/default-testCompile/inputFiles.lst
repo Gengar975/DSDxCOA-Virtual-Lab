@@ -1,0 +1,14 @@
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\alu\AluTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\arithmetic\BoothMultiplierTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\arithmetic\NonRestoringDivisionTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\arithmetic\RestoringDivisionTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\cpu\RegisterTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\fpu\Ieee754ConverterTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\memory\CacheTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\coa\memory\MemoryTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\dsd\AdvancedCombinationalTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\dsd\BooleanExpressionParserTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\dsd\CombinationalTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\dsd\LogicGatesTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\dsd\NumberConverterTest.java
+D:\DSDxCOA-Virtual-Lab-main\src\test\java\dsd\RippleCarryAdderSubtractorTest.java
