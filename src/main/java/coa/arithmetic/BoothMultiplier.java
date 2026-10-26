@@ -33,8 +33,8 @@ public final class BoothMultiplier {
      *                 in this signed range.
      */
     public static BoothMultiplicationResult multiply(long multiplicand, long multiplier, int bitWidth) {
-        if (bitWidth < 2) {
-            throw new IllegalArgumentException("bitWidth must be at least 2.");
+        if (bitWidth < 2 || bitWidth > 62) {
+            throw new IllegalArgumentException("bitWidth must be between 2 and 62 (got " + bitWidth + ").");
         }
         BitUtils.requireFitsSigned(multiplicand, bitWidth, "Multiplicand");
         BitUtils.requireFitsSigned(multiplier, bitWidth, "Multiplier");
@@ -55,32 +55,36 @@ public final class BoothMultiplier {
             StringBuilder step = new StringBuilder("Iteration " + iteration + ": Q0Q-1 = " +
                 (q0 ? '1' : '0') + (qMinus1 ? '1' : '0'));
 
+            // The add/subtract is done on (bitWidth + 1) bits. A + M or A - M can need one
+            // more bit than the registers hold (e.g. 0 - (-8) = 8 does not fit in 4 bits),
+            // so a sign-extended extra bit keeps the intermediate value correct.
+            boolean[] aExt = BitUtils.padLeading(a, 1, true);
+            boolean[] mExt = BitUtils.padLeading(m, 1, true);
+            boolean[] sum;
+
             if (q0 && !qMinus1) {
                 // 10 -> A = A - M
-                AluArithmeticResult sub = ADDER.compute(a, m, true);
-                a = sub.getResultBits();
-                step.append(" -> A = A - M -> A = ").append(BitUtils.toBinaryString(a));
+                sum = ADDER.compute(aExt, mExt, true).getResultBits();
+                step.append(" -> A = A - M -> A = ").append(BitUtils.toBinaryString(sum));
             } else if (!q0 && qMinus1) {
                 // 01 -> A = A + M
-                AluArithmeticResult add = ADDER.compute(a, m, false);
-                a = add.getResultBits();
-                step.append(" -> A = A + M -> A = ").append(BitUtils.toBinaryString(a));
+                sum = ADDER.compute(aExt, mExt, false).getResultBits();
+                step.append(" -> A = A + M -> A = ").append(BitUtils.toBinaryString(sum));
             } else {
                 // 00 or 11 -> no arithmetic operation
+                sum = aExt;
                 step.append(" -> no operation (A unchanged = ").append(BitUtils.toBinaryString(a)).append(")");
             }
 
-            // Arithmetic right shift across the combined A:Q:Q-1 register.
+            // Arithmetic right shift across the combined A:Q:Q-1 register. The last bit of
+            // the (bitWidth + 1)-bit sum drops into the top of Q; the first bitWidth bits of
+            // the sum become the new A (this is exactly "sum shifted right, sign kept").
             boolean newQMinus1 = q[bitWidth - 1];
             for (int i = bitWidth - 1; i >= 1; i--) {
                 q[i] = q[i - 1];
             }
-            q[0] = a[bitWidth - 1];
-            boolean signBit = a[0]; // preserved by arithmetic shift
-            for (int i = bitWidth - 1; i >= 1; i--) {
-                a[i] = a[i - 1];
-            }
-            a[0] = signBit;
+            q[0] = sum[bitWidth];
+            a = java.util.Arrays.copyOfRange(sum, 0, bitWidth);
             qMinus1 = newQMinus1;
 
             step.append(" | after arithmetic shift: A = ").append(BitUtils.toBinaryString(a))

@@ -17,6 +17,10 @@ public class TruthTable {
         this.outputValues = new ArrayList<>();
 
         int numVars = variableNames.size();
+        if (numVars > 16) {
+            throw new IllegalArgumentException("Too many variables (" + numVars
+                + "). A truth table supports at most 16 variables (65,536 rows).");
+        }
         int totalCombinations = 1 << numVars; // 2^N combinations
 
         for (int i = 0; i < totalCombinations; i++) {

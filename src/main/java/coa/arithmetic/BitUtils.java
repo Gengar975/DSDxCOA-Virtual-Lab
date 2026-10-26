@@ -20,6 +20,9 @@ public final class BitUtils {
 
     /** Converts a signed value into an n-bit two's-complement bit array (MSB at index 0). */
     public static boolean[] toBits(long value, int width) {
+        if (width < 1 || width > 64) {
+            throw new IllegalArgumentException("Bit width must be between 1 and 64 (got " + width + ").");
+        }
         boolean[] bits = new boolean[width];
         for (int i = 0; i < width; i++) {
             int shift = width - 1 - i;
@@ -62,6 +65,9 @@ public final class BitUtils {
 
     /** Returns a copy of {@code bits} padded with {@code extraLeadingBits} zero/sign bits at the front (index 0). */
     public static boolean[] padLeading(boolean[] bits, int extraLeadingBits, boolean signExtend) {
+        if (extraLeadingBits < 0) {
+            throw new IllegalArgumentException("Number of padding bits cannot be negative (got " + extraLeadingBits + ").");
+        }
         boolean[] result = new boolean[bits.length + extraLeadingBits];
         boolean signBit = signExtend && bits.length > 0 && bits[0];
         for (int i = 0; i < extraLeadingBits; i++) {

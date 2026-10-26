@@ -1,4 +1,5 @@
 import javax.swing.*;
+import javax.swing.border.Border;
 import javax.swing.border.EmptyBorder;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
@@ -15,6 +16,9 @@ import javax.swing.tree.DefaultTreeCellRenderer;
 import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.TreePath;
 import java.awt.*;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.geom.AffineTransform;
@@ -22,7 +26,9 @@ import java.awt.geom.Arc2D;
 import java.awt.geom.Ellipse2D;
 import java.awt.geom.Path2D;
 import java.awt.geom.RoundRectangle2D;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.PrintStream;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Executable;
@@ -35,11 +41,14 @@ import java.lang.reflect.ParameterizedType;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.security.CodeSource;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -48,8 +57,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.Callable;
+import java.util.function.Consumer;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * DSD x COA Virtual Lab.
@@ -303,6 +315,8 @@ public class MainApp extends JFrame {
         final JComponent comp;
         final Callable<Object> get;
         final Callable<String> shown;
+        String type = "";          // clean type name, used in error messages
+        String unsupported = null; // set when this input cannot be typed into a form
 
         PField(String name, String typeText, JComponent comp, Callable<Object> get, Callable<String> shown) {
             this.name = name; this.typeText = typeText; this.comp = comp; this.get = get; this.shown = shown;
@@ -312,15 +326,24 @@ public class MainApp extends JFrame {
     static List<PField> fieldsFor(Executable ex) {
         List<PField> list = new ArrayList<>();
         Parameter[] ps = ex.getParameters();
-        for (int i = 0; i < ps.length; i++) list.add(makeField(ps[i], i));
+        // When the project was compiled without "-parameters" the real names are lost (arg0, arg1...).
+        // In that case they are recovered from the source file, if it can be found.
+        String[] names = ps.length > 0 && !ps[0].isNamePresent() ? sourceParamNames(ex) : null;
+        for (int i = 0; i < ps.length; i++) list.add(makeField(ex, ps[i], i, names));
         return list;
     }
 
-    static PField makeField(Parameter p, int idx) {
+    static PField makeField(Executable ex, Parameter p, int idx, String[] names) {
         Class<?> t = p.getType();
         java.lang.reflect.Type gt = p.getParameterizedType();
-        String name = p.isNamePresent() ? p.getName() : "arg" + idx;
+        String name = p.isNamePresent() ? p.getName() : (names != null && idx < names.length ? names[idx] : "arg" + idx);
         String tn = typeName(gt);
+        PField pf = makeField0(ex, t, gt, name, tn);
+        pf.type = tn;
+        return pf;
+    }
+
+    static PField makeField0(Executable ex, Class<?> t, java.lang.reflect.Type gt, String name, String tn) {
         if (t == boolean.class || t == Boolean.class) {
             JComboBox<String> cb = combo("true", "false");
             return new PField(name, tn, cb, () -> cb.getSelectedIndex() == 0, () -> (String) cb.getSelectedItem());
@@ -332,13 +355,81 @@ public class MainApp extends JFrame {
             JComboBox<String> cb = combo(labels);
             return new PField(name, tn, cb, () -> cs[cb.getSelectedIndex()], () -> (String) cb.getSelectedItem());
         }
+        if (Map.class.isAssignableFrom(t)) {
+            // Named inputs such as the pins of an adder: typed as  A=1, B=0, CIN=1
+            List<String> pins = pinsOf(ex.getDeclaringClass());
+            String prefix = pinPrefixOf(ex.getDeclaringClass());
+            String example = "A=1, B=0";
+            if (!pins.isEmpty()) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < pins.size(); i++) sb.append(i > 0 ? ", " : "").append(pins.get(i)).append(i % 2 == 0 ? "=1" : "=0");
+                example = sb.toString();
+            } else if (prefix != null) example = prefix + "3=1, " + prefix + "5=1";
+            HintField tf = hintField("e.g. " + example, 16);
+            tf.setToolTipText("Type NAME=VALUE pairs separated by commas. Values: 1/0 or true/false. Names that are left out count as 0.");
+            String pinHelp = !pins.isEmpty() ? "pins: " + String.join(", ", pins)
+                    : prefix != null ? "pins: " + prefix + "0 ... (name=value)" : "name=value pairs";
+            List<String> allowed = pins;
+            return new PField(name, tn + "  (" + pinHelp + ")", tf, () -> {
+                Object m = parseMap(gt, tf.getText());
+                for (Object k : ((Map<?, ?>) m).keySet()) {
+                    String key = String.valueOf(k);
+                    boolean known = allowed.isEmpty() || allowed.contains(key) || (prefix != null && key.startsWith(prefix));
+                    if (!known) throw new IllegalArgumentException("unknown pin '" + key + "'. This circuit uses: " + String.join(", ", allowed));
+                }
+                return m;
+            }, tf::getText);
+        }
+        if (t.isInterface() && t.getName().startsWith("java.util.function")) {
+            JLabel lab = label("not available in this form", SMALL_BOLD, WARN);
+            PField pf = new PField(name, tn, lab, () -> { throw new IllegalArgumentException("needs a Java function"); }, () -> "-");
+            pf.unsupported = "this input is a Java function (lambda), which cannot be typed into a form";
+            return pf;
+        }
         if (isTextType(t)) {
-            JTextField tf = field("", 16);
+            HintField tf = hintField(exampleFor(t, name), 16);
             String hint = t.isArray() ? tn + "  (comma separated)" : tn;
+            if (t == int.class || t == long.class || t == short.class || t == byte.class
+                    || t == Integer.class || t == Long.class || t == Short.class || t == Byte.class)
+                tf.setToolTipText("Whole number. Binary (0b1011) and hex (0xFF) are accepted too.");
+            else if (t.isArray() || Collection.class.isAssignableFrom(t))
+                tf.setToolTipText("Values separated by commas, e.g. 1,0,1,1  (bits can also be typed as 1011).");
             return new PField(name, hint, tf, () -> convert(t, gt, tf.getText()), tf::getText);
         }
         RegistryCombo rc = new RegistryCombo(t);
-        return new PField(name, tn + "  (pick an object)", rc, rc::value, () -> String.valueOf(rc.getSelectedItem()));
+        rc.setToolTipText("Pick an object that was created earlier. Create one from the " + t.getSimpleName() + " page if the list is empty.");
+        return new PField(name, tn + "  (pick an object created earlier)", rc, () -> {
+            Object o = rc.value();
+            if (o == null) throw new IllegalArgumentException("no " + t.getSimpleName()
+                    + " selected. Create one first (open the " + t.getSimpleName() + " page), then pick it here");
+            return o;
+        }, () -> String.valueOf(rc.getSelectedItem()));
+    }
+
+    /** A short example shown in grey inside an empty input box. */
+    static String exampleFor(Class<?> t, String name) {
+        String n = name.toLowerCase();
+        if (t == double.class || t == Double.class || t == float.class || t == Float.class) return "e.g. 3.14";
+        if (t == char.class || t == Character.class) return "one character";
+        if (t == boolean[].class || t == Boolean[].class) return "e.g. 1,0,1,1";
+        if (t.isArray() || Collection.class.isAssignableFrom(t) || t == Iterable.class) {
+            if (n.contains("minterm") || n.contains("term")) return "e.g. 1,3,5";
+            if (n.contains("name") || n.contains("var")) return "e.g. A,B,C";
+            return "e.g. 1,2,3";
+        }
+        if (t == String.class || t == CharSequence.class || t == Object.class) {
+            if (n.contains("expr")) return "e.g. A & !B | C";
+            if (n.contains("hex")) return "e.g. 2F";
+            if (n.contains("octal")) return "e.g. 17";
+            if (n.contains("bin") || n.contains("bits")) return "e.g. 1011";
+            if (n.contains("decimal") || n.contains("digit")) return "e.g. 25";
+            if (n.contains("text")) return "e.g. Hi";
+            if (n.contains("name")) return "e.g. R1";
+            return "type text";
+        }
+        if (n.contains("width") || n.contains("bits")) return "e.g. 8";
+        if (n.contains("address")) return "e.g. 12";
+        return "e.g. 5";
     }
 
     static boolean isTextType(Class<?> t) {
@@ -378,14 +469,10 @@ public class MainApp extends JFrame {
             if (t.isPrimitive()) throw new IllegalArgumentException("a value is required");
             return null;
         }
-        if (t == int.class || t == Integer.class) {
-            long v = parseIntegral(s);
-            if (v < Integer.MIN_VALUE || v > Integer.MAX_VALUE) throw new IllegalArgumentException("number too large for int");
-            return (int) v;
-        }
-        if (t == long.class || t == Long.class) return parseIntegral(s);
-        if (t == short.class || t == Short.class) return (short) parseIntegral(s);
-        if (t == byte.class || t == Byte.class) return (byte) parseIntegral(s);
+        if (t == int.class || t == Integer.class) return (int) ranged(s, 32, "int");
+        if (t == long.class || t == Long.class) return parseIntegral(s, 64);
+        if (t == short.class || t == Short.class) return (short) ranged(s, 16, "short");
+        if (t == byte.class || t == Byte.class) return (byte) ranged(s, 8, "byte");
         if (t == double.class || t == Double.class) return Double.parseDouble(s);
         if (t == float.class || t == Float.class) return Float.parseFloat(s);
         if (t == BigInteger.class) return new BigInteger(s);
@@ -394,8 +481,21 @@ public class MainApp extends JFrame {
         throw new IllegalArgumentException("unsupported type " + t.getSimpleName());
     }
 
-    static long parseIntegral(String s) {
-        String x = s.replace("_", "").trim();
+    static long ranged(String s, int bits, String typeName) {
+        long v = parseIntegral(s, bits);
+        long min = -(1L << (bits - 1)), max = (1L << (bits - 1)) - 1;
+        if (v < min || v > max)
+            throw new IllegalArgumentException("'" + s + "' is out of range for " + typeName + " (" + min + " to " + max + ")");
+        return v;
+    }
+
+    /**
+     * Parses decimal, 0b binary and 0x hex numbers. A binary/hex literal is treated as a bit pattern of the
+     * given width, so 0xFFFFFFFF is accepted for an int (it means -1) - needed for IEEE 754 patterns of
+     * negative numbers such as 0xC0490FDB.
+     */
+    static long parseIntegral(String s, int bits) {
+        String x = s.replace("_", "").replace(" ", "").trim();
         boolean neg = false;
         if (x.startsWith("-")) { neg = true; x = x.substring(1); }
         else if (x.startsWith("+")) x = x.substring(1);
@@ -403,8 +503,15 @@ public class MainApp extends JFrame {
         String l = x.toLowerCase();
         if (l.startsWith("0b")) { radix = 2; x = x.substring(2); }
         else if (l.startsWith("0x")) { radix = 16; x = x.substring(2); }
-        long v = Long.parseLong(x, radix);
-        return neg ? -v : v;
+        if (radix != 10 && !neg) {
+            long v = Long.parseUnsignedLong(x, radix);
+            if (bits < 64) {
+                if (v >= (1L << bits)) throw new IllegalArgumentException("'" + s + "' does not fit in " + bits + " bits");
+                if ((v & (1L << (bits - 1))) != 0) v -= (1L << bits);
+            }
+            return v;
+        }
+        return Long.parseLong((neg ? "-" : "") + x, radix);
     }
 
     static boolean parseBool(String s) {
@@ -443,8 +550,110 @@ public class MainApp extends JFrame {
         return c;
     }
 
+    static Object parseMap(java.lang.reflect.Type gt, String raw) throws Exception {
+        Class<?> kt = String.class, vt = String.class;
+        if (gt instanceof ParameterizedType) {
+            java.lang.reflect.Type[] a = ((ParameterizedType) gt).getActualTypeArguments();
+            if (a.length == 2) {
+                if (a[0] instanceof Class) kt = (Class<?>) a[0];
+                if (a[1] instanceof Class) vt = (Class<?>) a[1];
+            }
+        }
+        Map<Object, Object> m = new LinkedHashMap<>();
+        String body = raw == null ? "" : raw.trim();
+        if (body.startsWith("{") && body.endsWith("}")) body = body.substring(1, body.length() - 1).trim();
+        if (body.isEmpty()) return m;
+        for (String part : body.split("[,;]")) {
+            String p = part.trim();
+            if (p.isEmpty()) continue;
+            int i = p.indexOf('=');
+            if (i < 0) i = p.indexOf(':');
+            if (i <= 0) throw new IllegalArgumentException("'" + p + "' should look like NAME=VALUE, for example A=1");
+            String k = p.substring(0, i).trim(), v = p.substring(i + 1).trim();
+            // pin / variable names in this lab are upper case (A, B, CIN, D3 ...)
+            if (kt == String.class) k = k.toUpperCase();
+            m.put(convert(kt, kt, k), convert(vt, vt, v));
+        }
+        return m;
+    }
+
+    // ------------------------------------------- reading names from the source
+    // Used to (a) recover parameter names when the project was compiled without
+    // "-parameters" and (b) tell the user which pin names a circuit understands.
+    static final Map<Class<?>, String> SOURCES = new HashMap<>();
+
+    static String sourceOf(Class<?> c) {
+        Class<?> top = c;
+        while (top.getEnclosingClass() != null) top = top.getEnclosingClass();
+        String cached = SOURCES.get(top);
+        if (cached != null) return cached;
+        String rel = top.getName().replace('.', File.separatorChar) + ".java";
+        String text = "";
+        for (String base : new String[]{"src/main/java", "src", "."}) {
+            File f = new File(System.getProperty("user.dir"), base + File.separator + rel);
+            if (f.isFile()) {
+                try { text = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8); break; }
+                catch (Exception ignored) { }
+            }
+        }
+        SOURCES.put(top, text);
+        return text;
+    }
+
+    static List<String> pinsOf(Class<?> c) {
+        Set<String> pins = new LinkedHashSet<>();
+        Matcher m = Pattern.compile("inputs\\.(?:getOrDefault|get|containsKey)\\(\\s*\"([A-Za-z][A-Za-z0-9_]*)\"\\s*[,)]").matcher(sourceOf(c));
+        while (m.find()) pins.add(m.group(1));
+        return new ArrayList<>(pins);
+    }
+
+    static String pinPrefixOf(Class<?> c) {
+        Matcher m = Pattern.compile("inputs\\.(?:getOrDefault|get|containsKey)\\(\\s*\"([A-Za-z]+)\"\\s*\\+").matcher(sourceOf(c));
+        return m.find() ? m.group(1) : null;
+    }
+
+    static String[] sourceParamNames(Executable ex) {
+        String src = sourceOf(ex.getDeclaringClass());
+        if (src.isEmpty()) return null;
+        String name = ex instanceof Constructor ? ex.getDeclaringClass().getSimpleName() : ex.getName();
+        Parameter[] ps = ex.getParameters();
+        Matcher mt = Pattern.compile("\\b" + Pattern.quote(name) + "\\s*\\(([^()]*)\\)\\s*(?:throws[^{;]*)?[{;]").matcher(src);
+        while (mt.find()) {
+            List<String> parts = splitParams(mt.group(1));
+            if (parts.size() != ps.length) continue;
+            String[] out = new String[ps.length];
+            boolean ok = true;
+            for (int i = 0; i < ps.length && ok; i++) {
+                String p = parts.get(i).replaceAll("@\\w+(\\([^)]*\\))?\\s*", "").replaceAll("\\bfinal\\s+", "").trim();
+                int sp = p.lastIndexOf(' ');
+                if (sp < 0) { ok = false; break; }
+                String type = p.substring(0, sp).trim().replaceAll("<.*>", "").replace("...", "[]").replace(" ", "");
+                type = type.substring(type.lastIndexOf('.') + 1);
+                if (!type.equals(ps[i].getType().getSimpleName())) ok = false;
+                else out[i] = p.substring(sp + 1).trim();
+            }
+            if (ok) return out;
+        }
+        return null;
+    }
+
+    static List<String> splitParams(String s) {
+        List<String> out = new ArrayList<>();
+        int depth = 0, start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '<') depth++;
+            else if (c == '>') depth--;
+            else if (c == ',' && depth == 0) { out.add(s.substring(start, i)); start = i + 1; }
+        }
+        if (!s.trim().isEmpty()) out.add(s.substring(start));
+        return out;
+    }
+
     // ---------------------------------------------------------- result output
     static class OutPane extends JTextPane {
+        private int lastHead = 0;
+
         OutPane() {
             setEditable(false);
             setBackground(FIELD);
@@ -465,6 +674,7 @@ public class MainApp extends JFrame {
 
         void head(String s) {
             if (getDocument().getLength() > 0) add("\n", TEXT, false);
+            lastHead = getDocument().getLength();
             add("> " + s + "\n", ACCENT, true);
         }
 
@@ -475,7 +685,25 @@ public class MainApp extends JFrame {
 
         void note(String s, Color c) { add(s + "\n", c, false); }
 
-        void end() { setCaretPosition(getDocument().getLength()); }
+        /** Scrolls so the START of the newest result is at the top (not the end of a long step list). */
+        void end() {
+            final int target = Math.min(lastHead, getDocument().getLength());
+            setCaretPosition(target);
+            SwingUtilities.invokeLater(() -> {
+                try {
+                    java.awt.geom.Rectangle2D r2 = modelToView2D(target);
+                    if (r2 == null) return;
+                    Rectangle r = r2.getBounds();
+                    r.height = Math.max(r.height, getVisibleRect().height);
+                    scrollRectToVisible(r);
+                } catch (BadLocationException ignored) { }
+            });
+        }
+
+        void clearAll() {
+            setText("");
+            lastHead = 0;
+        }
     }
 
     static boolean isScalar(Object o) {
@@ -614,25 +842,53 @@ public class MainApp extends JFrame {
         return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
     }
 
+    /** Turns an exception into a short message a student can act on. */
+    static String describe(Throwable t) {
+        String n = t.getClass().getSimpleName(), m = t.getMessage();
+        boolean plain = t instanceof IllegalArgumentException || t instanceof IllegalStateException
+                || t instanceof ArithmeticException || t instanceof UnsupportedOperationException;
+        if (m == null || m.isEmpty())
+            return n + " - the method gave no details" + (t instanceof NullPointerException ? " (an input may be missing or empty)" : "");
+        return plain ? "Error: " + m : n + ": " + m;
+    }
+
     static void execute(Class<?> cls, Method m, Object target, Object[] args, String shown, OutPane out) {
         out.head(cls.getSimpleName() + "." + m.getName() + "(" + shown + ")");
+        // Some methods print instead of returning (for example KMapSolver.printGrid). Capture that text
+        // so it appears in the Output panel instead of silently going to the console.
+        PrintStream oldOut = System.out, oldErr = System.err;
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        PrintStream cap = new PrintStream(buf, true, StandardCharsets.UTF_8);
+        String printed = "";
         try {
+            System.setOut(cap);
+            System.setErr(cap);
             try { m.setAccessible(true); } catch (Exception ignored) { }
             Object res = m.invoke(target, args);
+            System.setOut(oldOut);
+            System.setErr(oldErr);
+            printed = buf.toString(StandardCharsets.UTF_8);
+            if (!printed.trim().isEmpty()) {
+                out.add("Printed by the method:\n", MUTED, false);
+                for (String line : printed.replace("\t", "   ").split("\r?\n")) out.add("   " + line + "\n", TEXT, false);
+            }
             if (m.getReturnType() == void.class) {
-                out.note("Done (no return value)", GOOD);
+                out.note("Done (the method returns no value)", GOOD);
             } else {
                 render(out, "Result", res, 0, 0);
                 if (res != null && !isScalar(res) && !res.getClass().isArray()
                         && !(res instanceof Iterable) && !(res instanceof Map)) {
-                    out.note("saved as " + register(res) + "  (usable as an argument elsewhere)", MUTED);
+                    out.note("saved as " + register(res) + "  (usable as an input elsewhere)", MUTED);
                 }
             }
         } catch (InvocationTargetException ex) {
             Throwable t = ex.getCause() == null ? ex : ex.getCause();
-            out.note(t.getClass().getSimpleName() + ": " + t.getMessage(), BAD);
+            out.note(describe(t), BAD);
         } catch (Exception ex) {
             out.note("Error: " + ex, BAD);
+        } finally {
+            System.setOut(oldOut);
+            System.setErr(oldErr);
         }
         boolean pureQuery = m.getParameterCount() == 0 && m.getReturnType() != void.class;
         if (target != null && !pureQuery && !props(target.getClass()).isEmpty()) {
@@ -642,15 +898,58 @@ public class MainApp extends JFrame {
         out.end();
     }
 
+    /** A problem with one input box; remembers which one so it can be highlighted. */
+    static class InputException extends IllegalArgumentException {
+        final PField field;
+        InputException(String msg, PField field) { super(msg); this.field = field; }
+    }
+
+    static final Border FIELD_BORDER = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(new Color(0x334155)), new EmptyBorder(5, 8, 5, 8));
+    static final Border ERROR_BORDER = BorderFactory.createCompoundBorder(
+            BorderFactory.createLineBorder(BAD, 2), new EmptyBorder(4, 7, 4, 7));
+
+    /** Marks an input red and puts the cursor in it; the red mark clears as soon as the user edits it. */
+    static void flagError(PField f) {
+        if (f == null) return;
+        JComponent c = f.comp;
+        if (c instanceof JTextField) {
+            final JTextField tf = (JTextField) c;
+            tf.setBorder(ERROR_BORDER);
+            tf.getDocument().addDocumentListener(new DocumentListener() {
+                private void reset() {
+                    SwingUtilities.invokeLater(() -> {
+                        tf.setBorder(FIELD_BORDER);
+                        tf.getDocument().removeDocumentListener(this);
+                    });
+                }
+                @Override public void insertUpdate(DocumentEvent e) { reset(); }
+                @Override public void removeUpdate(DocumentEvent e) { reset(); }
+                @Override public void changedUpdate(DocumentEvent e) { reset(); }
+            });
+        }
+        c.requestFocusInWindow();
+    }
+
     static Object[] gather(List<PField> fs) {
         Object[] args = new Object[fs.size()];
         for (int i = 0; i < args.length; i++) {
             PField f = fs.get(i);
+            String label = human(f.name);
+            if (f.unsupported != null) throw new InputException("Input '" + label + "': " + f.unsupported, f);
             try {
                 args[i] = f.get.call();
             } catch (Exception ex) {
-                String msg = ex.getMessage() == null ? ex.toString() : ex.getMessage();
-                throw new IllegalArgumentException("Input '" + f.name + "': " + msg);
+                Throwable c = ex instanceof InvocationTargetException && ex.getCause() != null ? ex.getCause() : ex;
+                String msg;
+                if (c instanceof NumberFormatException) {
+                    String raw = "";
+                    try { raw = f.shown.call(); } catch (Exception ignored) { }
+                    msg = raw == null || raw.trim().isEmpty()
+                            ? "a value is required"
+                            : "'" + raw.trim() + "' is not a valid " + f.type + " (use digits only, e.g. 12, 0b1010 or 0xFF)";
+                } else msg = c.getMessage() == null ? c.toString() : c.getMessage();
+                throw new InputException("Input '" + label + "': " + msg, f);
             }
         }
         return args;
@@ -667,7 +966,7 @@ public class MainApp extends JFrame {
     // ================================================================== APP
     private final CardLayout cards = new CardLayout();
     private final JPanel content = new JPanel(cards);
-    private final Set<String> built = new HashSet<>();
+    private final Map<String, JComponent> classPages = new HashMap<>();
     private final List<Info> infos;
     private final Map<String, Btn> nav = new LinkedHashMap<>();
     private final SearchField search = new SearchField("Search modules, operations, or concepts...");
@@ -677,8 +976,10 @@ public class MainApp extends JFrame {
     public MainApp() {
         super("DigiCore Lab");
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-        setSize(1440, 880);
-        setMinimumSize(new Dimension(1200, 740));
+        // Fit the window to the screen: a fixed 1440x880 window is cut off on 1366x768 laptops.
+        Rectangle scr = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
+        setSize(Math.min(1440, scr.width), Math.min(880, scr.height));
+        setMinimumSize(new Dimension(Math.min(1000, scr.width), Math.min(620, scr.height)));
         setLocationRelativeTo(null);
 
         infos = discover();
@@ -716,19 +1017,31 @@ public class MainApp extends JFrame {
         highlight(key.equals("search") ? "" : key);
     }
 
-    private void showClass(Info info) {
+    private void showClass(Info info) { showClass(info, null); }
+
+    /** Opens a class page; when a method name is given, scrolls to that method and highlights it. */
+    private void showClass(Info info, String method) {
         String key = info.cls.getName();
-        if (!built.contains(key)) {
+        JComponent pg = classPages.get(key);
+        if (pg == null) {
             Btn back = new Btn("< Back", false);
             back.addActionListener(e -> show(origin));
             String lab = info.section.equals("Playground") ? "Experiments" : info.section + " Lab";
-            content.add(page(info.cls.getSimpleName(),
+            JComponent body = buildClassPage(info);
+            pg = page(info.cls.getSimpleName(),
                     lab + "  >  " + groupTitle(info.group) + "   |   " + info.methods.size() + (info.methods.size() == 1 ? " method" : " methods"),
-                    buildClassPage(info), flowRight(back)), key);
-            built.add(key);
+                    body, flowRight(back));
+            pg.putClientProperty("jump", body.getClientProperty("jump"));
+            content.add(pg, key);
+            classPages.put(key, pg);
         }
         cards.show(content, key);
         highlight(origin.equals("search") ? "" : origin);
+        Object j = pg.getClientProperty("jump");
+        if (method != null && j instanceof Consumer) {
+            @SuppressWarnings("unchecked") Consumer<String> jump = (Consumer<String>) j;
+            jump.accept(method);
+        }
     }
 
     private List<Info> sectionList(String sec) {
@@ -825,6 +1138,18 @@ public class MainApp extends JFrame {
         bar.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createMatteBorder(0, 0, 1, 0, LINE), new EmptyBorder(14, 28, 14, 28)));
         search.addActionListener(e -> runSearch(search.getText()));
+        // search while typing (short delay so it does not rebuild the page on every key)
+        Timer searchTimer = new Timer(250, e -> runSearch(search.getText()));
+        searchTimer.setRepeats(false);
+        search.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e) { searchTimer.restart(); }
+            @Override public void removeUpdate(DocumentEvent e) { searchTimer.restart(); }
+            @Override public void changedUpdate(DocumentEvent e) { searchTimer.restart(); }
+        });
+        search.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "clearSearch");
+        search.getActionMap().put("clearSearch", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) { search.setText(""); }
+        });
         JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
         left.setOpaque(false);
         left.add(search);
@@ -856,48 +1181,85 @@ public class MainApp extends JFrame {
     }
 
     // ----------------------------------------------------------------- search
+    /** Lower-case letters and digits only, so "k-map", "K Map" and "KMap" all match. */
+    private static String norm(String s) { return s.toLowerCase().replaceAll("[^a-z0-9]", ""); }
+
+    private static boolean matchesAll(String target, String[] tokens) {
+        String t = norm(target);
+        for (String k : tokens) if (!t.contains(k)) return false;
+        return true;
+    }
+
+    private static String methodsText(Info i) {
+        return i.methods.size() + (i.methods.size() == 1 ? " method" : " methods");
+    }
+
     private void runSearch(String text) {
         String q = text == null ? "" : text.trim();
-        if (q.isEmpty()) { show("home"); return; }
-        String lq = q.toLowerCase();
+        if (q.isEmpty()) {
+            if (origin.equals("search")) show("home");
+            return;
+        }
+        List<String> toks = new ArrayList<>();
+        for (String w : q.split("\\s+")) {
+            String n = norm(w);
+            if (!n.isEmpty()) toks.add(n);
+        }
+        if (toks.isEmpty()) return;
+        String[] tokens = toks.toArray(new String[0]);
+
         JPanel box = vbox();
         int shown = 0;
-        for (Info i : infos) {
-            if (i.cls.getSimpleName().toLowerCase().contains(lq)) {
-                box.add(left(resultRow(i, i.cls.getSimpleName(), groupTitle(i.group) + "   |   " + i.methods.size() + (i.methods.size() == 1 ? " method" : " methods"))));
+        Set<Info> listed = new HashSet<>();
+        for (Info i : infos) {   // class name matches first
+            if (matchesAll(i.cls.getSimpleName(), tokens)) {
+                box.add(left(resultRow(i, i.cls.getSimpleName(), groupTitle(i.group) + "   |   " + methodsText(i), null)));
                 box.add(Box.createVerticalStrut(6));
+                listed.add(i);
                 shown++;
             }
         }
-        for (Info i : infos) {
+        for (Info i : infos) {   // then topic matches ("gates", "sequential", "memory" ...)
+            if (listed.contains(i) || shown >= 60) continue;
+            if (matchesAll(i.cls.getSimpleName() + " " + groupTitle(i.group) + " " + i.section, tokens)) {
+                box.add(left(resultRow(i, i.cls.getSimpleName(), groupTitle(i.group) + "   |   " + methodsText(i), null)));
+                box.add(Box.createVerticalStrut(6));
+                listed.add(i);
+                shown++;
+            }
+        }
+        for (Info i : infos) {   // then individual methods; clicking one jumps straight to it
+            Set<String> seen = new HashSet<>();
             for (Method m : i.methods) {
-                if (shown >= 80) break;
-                if (m.getName().toLowerCase().contains(lq)) {
-                    box.add(left(resultRow(i, i.cls.getSimpleName() + "." + m.getName() + "()", groupTitle(i.group))));
+                if (shown >= 60) break;
+                if (!seen.add(m.getName())) continue;
+                if (matchesAll(i.cls.getSimpleName(), tokens)) continue;
+                if (matchesAll(i.cls.getSimpleName() + m.getName(), tokens)) {
+                    box.add(left(resultRow(i, i.cls.getSimpleName() + "." + m.getName() + "()", groupTitle(i.group), m.getName())));
                     box.add(Box.createVerticalStrut(6));
                     shown++;
                 }
             }
         }
-        if (shown == 0) box.add(left(label("Nothing matched \"" + q + "\". Try a class or method name.", BASE, WARN)));
+        if (shown == 0) box.add(left(label("Nothing matched \"" + q + "\". Try a class or method name, or a topic like \"adder\" or \"cache\".", BASE, WARN)));
         Card card = new Card(new BorderLayout());
         card.add(box, BorderLayout.CENTER);
         VPanel holder = new VPanel(new BorderLayout());
         holder.setOpaque(false);
         holder.add(card, BorderLayout.NORTH);
         if (searchPage != null) content.remove(searchPage);
-        searchPage = page("Search", "Results for \"" + q + "\"", scroll(holder), null);
+        searchPage = page("Search", shown + (shown == 1 ? " result" : " results") + " for \"" + q + "\"", scroll(holder), null);
         content.add(searchPage, "search");
         content.revalidate();
         show("search");
     }
 
-    private JComponent resultRow(Info info, String title, String sub) {
+    private JComponent resultRow(Info info, String title, String sub, String method) {
         Row r = new Row(new BorderLayout(10, 0));
         r.add(label(title, BOLD, TEXT), BorderLayout.WEST);
         r.add(label(sub, BASE, MUTED), BorderLayout.CENTER);
         r.add(label(">", BOLD, MUTED), BorderLayout.EAST);
-        r.onClick(() -> showClass(info));
+        r.onClick(() -> showClass(info, method));
         return r;
     }
 
@@ -1029,14 +1391,12 @@ public class MainApp extends JFrame {
         body.add(hero);
         body.add(Box.createVerticalStrut(18));
 
-        JPanel quick = new JPanel(new GridLayout(1, 4, 16, 0));
-        quick.setOpaque(false);
+        AdaptiveGrid quick = new AdaptiveGrid(4, 2, 1180, 16);
         quick.add(quickCard(Ico.BOOK, BLUE, "DSD", "Logic \u2022 Gates \u2022 Circuits", "dsd"));
         quick.add(quickCard(Ico.CHIP, PURPLE, "COA", "ALU \u2022 Registers \u2022 Memory", "coa"));
         quick.add(quickCard(Ico.FLASK, GREEN, "Experiments", "Hands-on Learning", "exp"));
         quick.add(quickCard(Ico.CLIP, ORANGE, "Quiz", "Test Your Knowledge", "quiz"));
         quick.setAlignmentX(0f);
-        quick.setMaximumSize(new Dimension(Integer.MAX_VALUE, quick.getPreferredSize().height));
         body.add(quick);
         body.add(Box.createVerticalStrut(18));
 
@@ -1052,7 +1412,9 @@ public class MainApp extends JFrame {
         JLabel viewAll = label("View All  >", BOLD, ACCENT);
         viewAll.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         viewAll.addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) { show("dsd"); }
+            @Override public void mouseReleased(MouseEvent e) {
+                if (e.getButton() == MouseEvent.BUTTON1 && viewAll.contains(e.getPoint())) show("dsd");
+            }
         });
         mh.add(viewAll, BorderLayout.EAST);
         mod.add(mh, BorderLayout.NORTH);
@@ -1064,7 +1426,7 @@ public class MainApp extends JFrame {
                 () -> show("dsd")));
         grid.add(new Pastel(new Color(0xEEE8FF), new Color(0xDACDFF), PURPLE, Ico.CHIP, "COA Lab",
                 "Computer Organization &amp; Architecture",
-                new String[]{"ALU &amp; Arithmetic Algorithms", "Registers &amp; Counters", "Memory &amp; Cache"},
+                new String[]{"ALU &amp; Arithmetic Algorithms", "Registers &amp; CPU Components", "Memory &amp; Cache"},
                 () -> show("coa")));
         grid.add(new Pastel(new Color(0xDDF8EE), new Color(0xC5F0E0), GREEN, Ico.FLASK, "Experiments",
                 "Guided Lab Activities",
@@ -1072,7 +1434,7 @@ public class MainApp extends JFrame {
                 () -> show("exp")));
         grid.add(new Pastel(new Color(0xFFF3DA), new Color(0xFFE6B0), ORANGE, Ico.CLIP, "Quiz",
                 "Practice &amp; Improve",
-                new String[]{"MCQs &amp; Short Questions", "Instant Feedback", "Track Your Progress"},
+                new String[]{"Coming soon", "Practice Questions", "Instant Feedback"},
                 () -> show("quiz")));
         mod.add(grid, BorderLayout.CENTER);
 
@@ -1087,12 +1449,8 @@ public class MainApp extends JFrame {
         rw.add(rightCol, BorderLayout.NORTH);
         rw.setPreferredSize(new Dimension(310, rightCol.getPreferredSize().height));
 
-        JPanel bottom = new JPanel(new BorderLayout(16, 0));
-        bottom.setOpaque(false);
-        bottom.add(mod, BorderLayout.CENTER);
-        bottom.add(rw, BorderLayout.EAST);
+        AdaptiveBottom bottom = new AdaptiveBottom(mod, rw);
         bottom.setAlignmentX(0f);
-        bottom.setMaximumSize(new Dimension(Integer.MAX_VALUE, bottom.getPreferredSize().height + 40));
         body.add(bottom);
 
         VPanel holder = new VPanel(new BorderLayout());
@@ -1119,7 +1477,9 @@ public class MainApp extends JFrame {
         c.addMouseListener(new MouseAdapter() {
             @Override public void mouseEntered(MouseEvent e) { c.bg = CARD_HOVER; c.repaint(); }
             @Override public void mouseExited(MouseEvent e) { c.bg = CARD; c.repaint(); }
-            @Override public void mouseClicked(MouseEvent e) { show(key); }
+            @Override public void mouseReleased(MouseEvent e) {
+                if (e.getButton() == MouseEvent.BUTTON1 && c.contains(e.getPoint())) show(key);
+            }
         });
         return c;
     }
@@ -1207,7 +1567,7 @@ public class MainApp extends JFrame {
         c.setBorder(new EmptyBorder(22, 22, 22, 22));
         c.add(new Badge(Ico.CLIP, ORANGE, 72), BorderLayout.WEST);
         JPanel t = vbox();
-        t.add(left(label("Quiz is ready for questions", new Font("Segoe UI", Font.BOLD, 20), TEXT)));
+        t.add(left(label("Quiz - coming soon", new Font("Segoe UI", Font.BOLD, 20), TEXT)));
         t.add(Box.createVerticalStrut(6));
         t.add(left(label("<html><div style='width:520px'>The project does not contain quiz classes yet, so this page is a placeholder. "
                 + "When your team adds one, it will show up in the labs automatically and can be linked here.</div></html>", BASE, MUTED)));
@@ -1245,7 +1605,7 @@ public class MainApp extends JFrame {
     static JComponent buildClassPage(Info info) {
         Class<?> cls = info.cls;
         OutPane out = new OutPane();
-        out.note("Pick a method on the left, fill in its inputs and press Run.", MUTED);
+        out.note("Pick a method on the left, fill in its inputs and press Run (Enter also works in an input box).", MUTED);
         out.note("Results appear here. Objects you create can be reused in other methods.", MUTED);
 
         boolean anyInstance = false;
@@ -1256,6 +1616,7 @@ public class MainApp extends JFrame {
         list.setLayout(new BoxLayout(list, BoxLayout.Y_AXIS));
         list.setOpaque(false);
 
+        Map<String, Card> cardsByName = new LinkedHashMap<>();
         if (anyInstance) {
             JComponent ic = instanceCard(cls, active, out);
             ic.setAlignmentX(0f);
@@ -1263,8 +1624,9 @@ public class MainApp extends JFrame {
             list.add(Box.createVerticalStrut(12));
         }
         for (Method m : info.methods) {
-            JComponent mc = methodCard(cls, m, active, out);
+            Card mc = methodCard(cls, m, active, out);
             mc.setAlignmentX(0f);
+            cardsByName.putIfAbsent(m.getName(), mc);
             list.add(mc);
             list.add(Box.createVerticalStrut(12));
         }
@@ -1283,7 +1645,7 @@ public class MainApp extends JFrame {
         bar.setOpaque(false);
         bar.add(label("Output", new Font("Segoe UI", Font.BOLD, 16), TEXT), BorderLayout.WEST);
         Btn clear = new Btn("Clear", false);
-        clear.addActionListener(e -> out.setText(""));
+        clear.addActionListener(e -> out.clearAll());
         bar.add(clear, BorderLayout.EAST);
         right.add(bar, BorderLayout.NORTH);
         JScrollPane osp = scroll(out);
@@ -1291,10 +1653,42 @@ public class MainApp extends JFrame {
         osp.getViewport().setBackground(FIELD);
         right.add(osp, BorderLayout.CENTER);
 
-        JPanel split = new JPanel(new GridLayout(1, 2, 16, 0));
+        // Inputs get 42% of the width and the output 58%: results (step lists) are the wider content.
+        left.setPreferredSize(new Dimension(420, 100));
+        right.setPreferredSize(new Dimension(580, 100));
+        JPanel split = new JPanel(new GridBagLayout());
         split.setOpaque(false);
-        split.add(left);
-        split.add(right);
+        GridBagConstraints gc = new GridBagConstraints();
+        gc.fill = GridBagConstraints.BOTH;
+        gc.weighty = 1;
+        gc.gridy = 0;
+        gc.gridx = 0;
+        gc.weightx = 0.42;
+        gc.insets = new Insets(0, 0, 0, 16);
+        split.add(left, gc);
+        gc.gridx = 1;
+        gc.weightx = 0.58;
+        gc.insets = new Insets(0, 0, 0, 0);
+        split.add(right, gc);
+
+        // used by search: scroll to a method's card and flash it
+        Consumer<String> jump = name -> {
+            Card c = cardsByName.get(name);
+            if (c == null) return;
+            Timer t = new Timer(150, ev -> {
+                Rectangle r = SwingUtilities.convertRectangle(c.getParent(), c.getBounds(), wrap);
+                r.height = Math.max(r.height, left.getViewport().getHeight());
+                wrap.scrollRectToVisible(r);
+                c.bg = CARD_HOVER;
+                c.repaint();
+                Timer back = new Timer(1400, e2 -> { c.bg = CARD; c.repaint(); });
+                back.setRepeats(false);
+                back.start();
+            });
+            t.setRepeats(false);
+            t.start();
+        };
+        split.putClientProperty("jump", jump);
         return split;
     }
 
@@ -1318,12 +1712,15 @@ public class MainApp extends JFrame {
             for (int i = 0; i < sigs.length; i++) sigs[i] = signature(cls.getSimpleName(), ctors.get(i));
             JComboBox<String> cc = combo(sigs);
             box.add(left(labeledRow("Constructor", "", cc)));
+            Btn create = new Btn("Create object", false);
             JPanel holder = new JPanel(new BorderLayout());
             holder.setOpaque(false);
             List<List<PField>> current = new ArrayList<>();
             current.add(new ArrayList<PField>());
             Runnable rebuild = () -> {
                 List<PField> fs = fieldsFor(ctors.get(cc.getSelectedIndex()));
+                for (PField f : fs)
+                    if (f.comp instanceof JTextField) ((JTextField) f.comp).addActionListener(ev -> create.doClick(0));
                 current.set(0, fs);
                 holder.removeAll();
                 holder.add(paramsPanel(fs), BorderLayout.CENTER);
@@ -1333,7 +1730,6 @@ public class MainApp extends JFrame {
             cc.addActionListener(e -> rebuild.run());
             rebuild.run();
             box.add(left(holder));
-            Btn create = new Btn("Create object", false);
             create.addActionListener(e -> {
                 List<PField> fs = current.get(0);
                 try {
@@ -1351,7 +1747,11 @@ public class MainApp extends JFrame {
                 } catch (InvocationTargetException ex) {
                     Throwable t = ex.getCause() == null ? ex : ex.getCause();
                     out.head("Could not create " + cls.getSimpleName());
-                    out.note(t.getClass().getSimpleName() + ": " + t.getMessage(), BAD);
+                    out.note(describe(t), BAD);
+                } catch (InputException ex) {
+                    out.head("Could not create " + cls.getSimpleName());
+                    out.note(ex.getMessage(), BAD);
+                    flagError(ex.field);
                 } catch (Exception ex) {
                     out.head("Could not create " + cls.getSimpleName());
                     out.note(String.valueOf(ex.getMessage() == null ? ex : ex.getMessage()), BAD);
@@ -1365,7 +1765,7 @@ public class MainApp extends JFrame {
         return card;
     }
 
-    static JComponent methodCard(Class<?> cls, Method m, RegistryCombo active, OutPane out) {
+    static Card methodCard(Class<?> cls, Method m, RegistryCombo active, OutPane out) {
         boolean isStatic = Modifier.isStatic(m.getModifiers());
         List<PField> fs = fieldsFor(m);
         Card card = new Card(new BorderLayout(0, 10));
@@ -1375,19 +1775,35 @@ public class MainApp extends JFrame {
         JPanel titles = new JPanel();
         titles.setOpaque(false);
         titles.setLayout(new BoxLayout(titles, BoxLayout.Y_AXIS));
-        titles.add(left(label(m.getName(), new Font("Segoe UI", Font.BOLD, 16), TEXT)));
+        // the input names after the title tell apart methods that share a name (overloads)
+        StringBuilder sig = new StringBuilder();
+        for (int i = 0; i < fs.size(); i++) sig.append(i > 0 ? ", " : "").append(fs.get(i).name);
+        titles.add(left(label("<html><b>" + m.getName() + "</b><font color='#98A3C7'>(" + sig + ")</font></html>",
+                new Font("Segoe UI", Font.PLAIN, 16), TEXT)));
         String ret = m.getReturnType() == void.class ? "void" : typeName(m.getGenericReturnType());
         titles.add(left(label("returns " + ret, SMALL_BOLD, MUTED)));
         head.add(titles, BorderLayout.CENTER);
         head.add(label(isStatic ? "STATIC" : "ON OBJECT", SMALL_BOLD, isStatic ? ACCENT : ACCENT2), BorderLayout.EAST);
         card.add(head, BorderLayout.NORTH);
 
+        String blocked = null;
+        for (PField f : fs)
+            if (f.unsupported != null) { blocked = "Cannot run from this form: '" + human(f.name) + "' " + f.unsupported + "."; break; }
+
         JPanel center = vbox();
         if (!fs.isEmpty()) center.add(left(paramsPanel(fs)));
         Btn run = new Btn("Run", false);
+        if (blocked != null) {
+            run.setEnabled(false);
+            run.setToolTipText(blocked);
+            center.add(left(label("<html><div style='width:320px'>" + blocked + "</div></html>", SMALL_BOLD, WARN)));
+        }
         center.add(Box.createVerticalStrut(6));
         center.add(left(flow(run)));
         card.add(center, BorderLayout.CENTER);
+
+        for (PField f : fs)
+            if (f.comp instanceof JTextField) ((JTextField) f.comp).addActionListener(e -> run.doClick(0));
 
         run.addActionListener(e -> {
             Object target = null;
@@ -1398,13 +1814,21 @@ public class MainApp extends JFrame {
                     target = active.value();
                     if (target == null) {
                         out.head(cls.getSimpleName() + "." + m.getName());
-                        out.note("Create an object first (see the Object card at the top), or pick one from the list.", WARN);
+                        out.note("This method works on an object, and none is selected yet.", WARN);
+                        out.note("1. Use the 'Object' card at the top of this page and press 'Create object'.", WARN);
+                        out.note("2. Press Run again.", WARN);
                         out.end();
+                        active.requestFocusInWindow();
                         return;
                     }
                 }
                 Object[] args = gather(fs);
                 execute(cls, m, target, args, shownArgs(fs), out);
+            } catch (InputException ex) {
+                out.head(cls.getSimpleName() + "." + m.getName());
+                out.note(ex.getMessage(), BAD);
+                out.end();
+                flagError(ex.field);
             } catch (Exception ex) {
                 out.head(cls.getSimpleName() + "." + m.getName());
                 out.note(String.valueOf(ex.getMessage() == null ? ex : ex.getMessage()), BAD);
@@ -1436,8 +1860,9 @@ public class MainApp extends JFrame {
     static JComponent labeledRow(String name, String hint, JComponent comp) {
         JPanel row = new JPanel(new BorderLayout(10, 0));
         row.setOpaque(false);
-        JLabel l = label(name, BASE, TEXT);
-        l.setPreferredSize(new Dimension(110, 30));
+        JLabel l = label(human(name), BASE, TEXT);
+        l.setToolTipText(name);
+        l.setPreferredSize(new Dimension(132, 30));
         row.add(l, BorderLayout.WEST);
         row.add(comp, BorderLayout.CENTER);
         if (!hint.isEmpty()) {
@@ -1504,13 +1929,47 @@ public class MainApp extends JFrame {
 
     static JTextField field(String text, int cols) {
         JTextField f = new JTextField(text, cols);
+        styleField(f);
+        return f;
+    }
+
+    static HintField hintField(String hint, int cols) {
+        HintField f = new HintField(hint, cols);
+        styleField(f);
+        return f;
+    }
+
+    static void styleField(JTextField f) {
         f.setFont(BASE);
         f.setBackground(FIELD);
         f.setForeground(TEXT);
         f.setCaretColor(TEXT);
-        f.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(0x334155)), new EmptyBorder(5, 8, 5, 8)));
-        return f;
+        f.setBorder(FIELD_BORDER);
+    }
+
+    /** Text box that shows a grey example while it is empty. */
+    static class HintField extends JTextField {
+        private final String hint;
+
+        HintField(String hint, int cols) {
+            super("", cols);
+            this.hint = hint;
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            if (getText().isEmpty() && hint != null && !hint.isEmpty()) {
+                Graphics2D h = (Graphics2D) g.create();
+                h.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+                h.setColor(new Color(0x5E6B96));
+                h.setFont(BASE.deriveFont(Font.ITALIC));
+                FontMetrics fm = h.getFontMetrics();
+                Insets in = getInsets();
+                h.drawString(hint, in.left, (getHeight() - fm.getHeight()) / 2 + fm.getAscent());
+                h.dispose();
+            }
+        }
     }
 
     static <T> void styleCombo(JComboBox<T> c) {
@@ -1586,6 +2045,71 @@ public class MainApp extends JFrame {
         @Override public int getScrollableBlockIncrement(Rectangle r, int o, int d) { return 120; }
         @Override public boolean getScrollableTracksViewportWidth() { return true; }
         @Override public boolean getScrollableTracksViewportHeight() { return false; }
+    }
+
+    /** Grid whose column count drops when the window is narrow, so cards are never squeezed or cut off. */
+    static class AdaptiveGrid extends JPanel {
+        private final int wide, narrow, breakAt;
+
+        AdaptiveGrid(int wide, int narrow, int breakAt, int gap) {
+            super(new GridLayout(0, wide, gap, gap));
+            this.wide = wide;
+            this.narrow = narrow;
+            this.breakAt = breakAt;
+            setOpaque(false);
+        }
+
+        private boolean fit(int width) {
+            if (width <= 0) return false;
+            int want = width < breakAt ? narrow : wide;
+            GridLayout gl = (GridLayout) getLayout();
+            if (gl.getColumns() == want) return false;
+            gl.setColumns(want);
+            return true;
+        }
+
+        @Override public void doLayout() {
+            if (fit(getWidth())) SwingUtilities.invokeLater(this::revalidate);
+            super.doLayout();
+        }
+
+        @Override public Dimension getPreferredSize() {
+            fit(getWidth() > 0 ? getWidth() : (getParent() != null ? getParent().getWidth() : 0));
+            return super.getPreferredSize();
+        }
+
+        @Override public Dimension getMaximumSize() {
+            return new Dimension(Integer.MAX_VALUE, getPreferredSize().height);
+        }
+    }
+
+    /** Main cards with a side column; the side column moves below when the window is narrow. */
+    static class AdaptiveBottom extends JPanel {
+        private final JComponent side;
+        private boolean stacked = false;
+
+        AdaptiveBottom(JComponent main, JComponent side) {
+            super(new BorderLayout(16, 16));
+            this.side = side;
+            setOpaque(false);
+            add(main, BorderLayout.CENTER);
+            add(side, BorderLayout.EAST);
+        }
+
+        @Override public void doLayout() {
+            boolean want = getWidth() > 0 && getWidth() < 980;
+            if (want != stacked) {
+                stacked = want;
+                remove(side);
+                add(side, stacked ? BorderLayout.SOUTH : BorderLayout.EAST);
+                SwingUtilities.invokeLater(this::revalidate);
+            }
+            super.doLayout();
+        }
+
+        @Override public Dimension getMaximumSize() {
+            return new Dimension(Integer.MAX_VALUE, getPreferredSize().height);
+        }
     }
 
     static class Card extends JPanel {
@@ -1803,7 +2327,9 @@ public class MainApp extends JFrame {
 
         void onClick(Runnable r) {
             addMouseListener(new MouseAdapter() {
-                @Override public void mouseClicked(MouseEvent e) { r.run(); }
+                @Override public void mouseReleased(MouseEvent e) {
+                    if (e.getButton() == MouseEvent.BUTTON1 && contains(e.getPoint())) r.run();
+                }
             });
         }
 
@@ -1927,7 +2453,7 @@ public class MainApp extends JFrame {
             JPanel t = vbox();
             t.add(Box.createVerticalStrut(2));
             t.add(left(label(title, new Font("Segoe UI", Font.BOLD, 22), INK)));
-            t.add(left(label("<html><div style='width:190px'>" + sub + "</div></html>", new Font("Segoe UI", Font.PLAIN, 13), new Color(0x3B4A6B))));
+            t.add(left(label("<html><div style='width:165px'>" + sub + "</div></html>", new Font("Segoe UI", Font.PLAIN, 13), new Color(0x3B4A6B))));
             head.add(t, BorderLayout.CENTER);
             add(head, BorderLayout.NORTH);
 
@@ -1943,7 +2469,9 @@ public class MainApp extends JFrame {
             addMouseListener(new MouseAdapter() {
                 @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
                 @Override public void mouseExited(MouseEvent e) { hover = false; repaint(); }
-                @Override public void mouseClicked(MouseEvent e) { go.run(); }
+                @Override public void mouseReleased(MouseEvent e) {
+                    if (e.getButton() == MouseEvent.BUTTON1 && contains(e.getPoint())) go.run();
+                }
             });
         }
 
@@ -2012,13 +2540,14 @@ public class MainApp extends JFrame {
             g2.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
             int w = getWidth(), h = getHeight();
             Color fill;
-            if (nav) fill = active ? PURPLE : hover ? new Color(255, 255, 255, 16) : null;
+            if (!isEnabled()) fill = new Color(0x2A3563);
+            else if (nav) fill = active ? PURPLE : hover ? new Color(255, 255, 255, 16) : null;
             else fill = hover ? new Color(0x9277FF) : PURPLE;
             if (fill != null) {
                 g2.setColor(fill);
                 g2.fillRoundRect(0, 0, w, h, nav ? 16 : 12, nav ? 16 : 12);
             }
-            Color ink = nav ? (active ? Color.WHITE : hover ? TEXT : MUTED) : Color.WHITE;
+            Color ink = !isEnabled() ? MUTED : nav ? (active ? Color.WHITE : hover ? TEXT : MUTED) : Color.WHITE;
             g2.setFont(getFont());
             g2.setColor(ink);
             FontMetrics fm = g2.getFontMetrics();

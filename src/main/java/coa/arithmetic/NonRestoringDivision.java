@@ -38,8 +38,8 @@ public final class NonRestoringDivision {
         if (divisor == 0) {
             throw new ArithmeticException("Division by zero.");
         }
-        if (bitWidth < 2) {
-            throw new IllegalArgumentException("bitWidth must be at least 2.");
+        if (bitWidth < 2 || bitWidth > 62) {
+            throw new IllegalArgumentException("bitWidth must be between 2 and 62 (got " + bitWidth + ").");
         }
 
         List<String> steps = new ArrayList<>();
@@ -55,9 +55,11 @@ public final class NonRestoringDivision {
                 "Operand magnitude exceeds " + bitWidth + "-bit register width.");
         }
 
-        boolean[] a = new boolean[bitWidth + 1];
+        // A and M are two guard bits wider than Q: one for the sign, and one so that the
+        // left shift of a negative A (down to about -2M) cannot overflow the register.
+        boolean[] a = new boolean[bitWidth + 2];
         boolean[] q = BitUtils.toBits(absDividend, bitWidth);
-        boolean[] m = BitUtils.padLeading(BitUtils.toBits(absDivisor, bitWidth), 1, false);
+        boolean[] m = BitUtils.padLeading(BitUtils.toBits(absDivisor, bitWidth), 2, false);
 
         steps.add("Initial: |Dividend| Q = " + BitUtils.toBinaryString(q) + " (" + absDividend + ")");
         steps.add("Initial: |Divisor|  M = " + BitUtils.toBinaryString(m) + " (" + absDivisor + ")");

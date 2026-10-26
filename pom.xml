@@ -10,9 +10,18 @@
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- keep real parameter names (multiplicand, bitWidth...) so the UI forms show them instead of arg0, arg1 -->
+        <maven.compiler.parameters>true</maven.compiler.parameters>
+        <javafx.version>21.0.5</javafx.version>
     </properties>
 
     <dependencies>
+        <!-- JavaFX: the DigiCore Lab learning application (lab.ui.LabApp) -->
+        <dependency>
+            <groupId>org.openjfx</groupId>
+            <artifactId>javafx-controls</artifactId>
+            <version>${javafx.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
@@ -20,4 +29,18 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!-- run the app with:  mvn clean javafx:run -->
+            <plugin>
+                <groupId>org.openjfx</groupId>
+                <artifactId>javafx-maven-plugin</artifactId>
+                <version>0.0.8</version>
+                <configuration>
+                    <mainClass>lab.ui.LabApp</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
 </project>

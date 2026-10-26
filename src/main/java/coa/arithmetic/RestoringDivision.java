@@ -35,8 +35,8 @@ public final class RestoringDivision {
         if (divisor == 0) {
             throw new ArithmeticException("Division by zero.");
         }
-        if (bitWidth < 2) {
-            throw new IllegalArgumentException("bitWidth must be at least 2.");
+        if (bitWidth < 2 || bitWidth > 62) {
+            throw new IllegalArgumentException("bitWidth must be between 2 and 62 (got " + bitWidth + ").");
         }
 
         List<String> steps = new ArrayList<>();
